@@ -11,6 +11,7 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
+import type { FieldCompletionRow, FieldReturnRow, ReconcileItem } from '../types/reconcile';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
@@ -19,7 +20,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -46,6 +47,9 @@ export type InspectionRow = Inspection;
 export type FaultRow = Fault;
 export type WorkOrderRow = WorkOrder;
 export type SpeedRestrictionRow = SpeedRestriction;
+export type FieldReturnRowRecord = FieldReturnRow;
+export type ReconcileItemRow = ReconcileItem;
+export type FieldCompletionRowRecord = FieldCompletionRow;
 
 class RailSwitchDatabase extends Dexie {
   yards!: Table<YardRow, string>;
@@ -54,6 +58,9 @@ class RailSwitchDatabase extends Dexie {
   faults!: Table<FaultRow, string>;
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
+  fieldReturns!: Table<FieldReturnRowRecord, string>;
+  reconciles!: Table<ReconcileItemRow, string>;
+  fieldCompletions!: Table<FieldCompletionRowRecord, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
   constructor() {
@@ -111,6 +118,54 @@ class RailSwitchDatabase extends Dexie {
           }
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
+        });
+      });
+
+    // v3：现场回传——新增回传包记录、待处理缺口、现场完工登记三张表；
+    //     旧作业单缺少派工基线时按兼容方式回填（backfilled=true），行修订号升至 ROW_REVISION。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        restrictions: 'id, yardId, switchCode',
+        fieldReturns: 'id, importedAt, stage',
+        reconciles: 'id, packageId, workOrderId, kind, status, [packageId+workOrderId]',
+        fieldCompletions: 'workOrderId, packageId',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('yards'),
+          tx.table('switches'),
+          tx.table('inspections'),
+          tx.table('faults'),
+          tx.table('workOrders'),
+          tx.table('restrictions'),
+        ];
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
+        }
+        // 兼容回填：旧作业单缺少派工基线时，按当前作业单内容冻结一份（标记 backfilled）
+        await tx.table('workOrders').toCollection().modify((row: Record<string, unknown>) => {
+          if (!row.dispatchBaseline) {
+            row.dispatchBaseline = {
+              workOrderId: row.id,
+              workOrderCode: row.code,
+              windowStart: row.windowStart,
+              windowEnd: row.windowEnd,
+              leader: row.leader,
+              members: Array.isArray(row.members) ? row.members : [],
+              machines: Array.isArray(row.machines) ? row.machines : [],
+              faultIds: Array.isArray(row.faultIds) ? row.faultIds : [],
+              frozenAt: typeof row.updatedAt === 'string' ? row.updatedAt : nowIso(),
+              backfilled: true,
+            };
+          }
         });
       });
   }
@@ -295,16 +350,31 @@ async function seedDatabase(): Promise<void> {
 
   groups.forEach((group, index) => {
     if (group.faults.length === 0) return;
+    const code = `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`;
+    const members =
+      index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'];
+    const machines = index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'];
     workOrders.push({
       id: `wo-${index + 1}`,
-      code: `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`,
+      code,
       faultIds: group.faults.map((item) => item.id),
       windowStart: group.start,
       windowEnd: group.end,
       leader: group.leader,
-      machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
-      members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
+      machines,
+      members,
       state: group.state,
+      dispatchBaseline: {
+        workOrderId: `wo-${index + 1}`,
+        workOrderCode: code,
+        windowStart: group.start,
+        windowEnd: group.end,
+        leader: group.leader,
+        members,
+        machines,
+        faultIds: group.faults.map((item) => item.id),
+        frozenAt: stamp,
+      },
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -528,6 +598,52 @@ export async function removeRestriction(id: string): Promise<void> {
   await db.restrictions.delete(id);
 }
 
+/* ======================== 现场回传 / 待处理缺口 ======================== */
+
+export async function listFieldReturns(): Promise<FieldReturnRowRecord[]> {
+  const rows = await db.fieldReturns.toArray();
+  return rows.sort((a, b) => b.importedAt.localeCompare(a.importedAt));
+}
+
+export async function getFieldReturn(id: string): Promise<FieldReturnRowRecord | undefined> {
+  return db.fieldReturns.get(id);
+}
+
+export async function putFieldReturn(row: FieldReturnRowRecord): Promise<void> {
+  await db.fieldReturns.put(row);
+}
+
+export async function listReconciles(): Promise<ReconcileItemRow[]> {
+  const rows = await db.reconciles.toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function putReconcile(row: ReconcileItemRow): Promise<void> {
+  await db.reconciles.put(row);
+}
+
+export async function putReconciles(rows: ReconcileItemRow[]): Promise<void> {
+  await db.reconciles.bulkPut(rows);
+}
+
+export async function listFieldCompletions(): Promise<FieldCompletionRowRecord[]> {
+  return db.fieldCompletions.toArray();
+}
+
+/** 按作业单取现场完工登记（核对销号时直接读库，避免状态刷新时序问题） */
+export async function getFieldReturnCompletion(workOrderId: string): Promise<FieldCompletionRowRecord | undefined> {
+  return db.fieldCompletions.get(workOrderId);
+}
+
+/** 按作业单取全部缺口记录（含已处理），状态推进 / 核对销号闸门使用 */
+export async function listReconcilesByOrder(workOrderId: string): Promise<ReconcileItemRow[]> {
+  return db.reconciles.where('workOrderId').equals(workOrderId).toArray();
+}
+
+export async function putFieldCompletion(row: FieldCompletionRowRecord): Promise<void> {
+  await db.fieldCompletions.put(row);
+}
+
 /* ========================== 整库导入导出 ========================== */
 
 export interface DatabaseSnapshot {
@@ -540,17 +656,24 @@ export interface DatabaseSnapshot {
   faults: Fault[];
   workOrders: WorkOrder[];
   restrictions: SpeedRestriction[];
+  fieldReturns?: FieldReturnRowRecord[];
+  reconciles?: ReconcileItemRow[];
+  fieldCompletions?: FieldCompletionRowRecord[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
-    listYards(),
-    listSwitches(),
-    listInspections(),
-    listFaults(),
-    listWorkOrders(),
-    listRestrictions(),
-  ]);
+  const [yards, switches, inspections, faults, workOrders, restrictions, fieldReturns, reconciles, fieldCompletions] =
+    await Promise.all([
+      listYards(),
+      listSwitches(),
+      listInspections(),
+      listFaults(),
+      listWorkOrders(),
+      listRestrictions(),
+      listFieldReturns(),
+      listReconciles(),
+      listFieldCompletions(),
+    ]);
   return {
     name: DB_NAME,
     schemaVersion: DB_SCHEMA_VERSION,
@@ -561,13 +684,51 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     faults,
     workOrders,
     restrictions,
+    fieldReturns,
+    reconciles,
+    fieldCompletions,
   };
 }
 
+/**
+ * 整库导入：兼容旧备份——
+ * 旧数据缺少派工基线时按当前作业单内容回填（backfilled=true），
+ * 旧备份没有现场回传三张表时按空表处理。
+ */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  const stamp = nowIso();
+  const compatWorkOrders = (snapshot.workOrders ?? []).map((order) =>
+    order.dispatchBaseline
+      ? order
+      : {
+          ...order,
+          dispatchBaseline: {
+            workOrderId: order.id,
+            workOrderCode: order.code,
+            windowStart: order.windowStart,
+            windowEnd: order.windowEnd,
+            leader: order.leader,
+            members: Array.isArray(order.members) ? order.members : [],
+            machines: Array.isArray(order.machines) ? order.machines : [],
+            faultIds: Array.isArray(order.faultIds) ? order.faultIds : [],
+            frozenAt: order.updatedAt ?? stamp,
+            backfilled: true,
+          },
+        },
+  );
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.fieldReturns,
+      db.reconciles,
+      db.fieldCompletions,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -576,13 +737,19 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.fieldReturns.clear(),
+        db.reconciles.clear(),
+        db.fieldCompletions.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
       await db.switches.bulkPut(snapshot.switches ?? []);
       await db.inspections.bulkPut(snapshot.inspections ?? []);
       await db.faults.bulkPut(snapshot.faults ?? []);
-      await db.workOrders.bulkPut(snapshot.workOrders ?? []);
+      await db.workOrders.bulkPut(compatWorkOrders);
       await db.restrictions.bulkPut(snapshot.restrictions ?? []);
+      if (snapshot.fieldReturns?.length) await db.fieldReturns.bulkPut(snapshot.fieldReturns);
+      if (snapshot.reconciles?.length) await db.reconciles.bulkPut(snapshot.reconciles);
+      if (snapshot.fieldCompletions?.length) await db.fieldCompletions.bulkPut(snapshot.fieldCompletions);
     },
   );
 }
@@ -591,7 +758,17 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.fieldReturns,
+      db.reconciles,
+      db.fieldCompletions,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +777,9 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.fieldReturns.clear(),
+        db.reconciles.clear(),
+        db.fieldCompletions.clear(),
       ]);
     },
   );
@@ -608,15 +788,19 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
-    db.yards.count(),
-    db.switches.count(),
-    db.inspections.count(),
-    db.faults.count(),
-    db.workOrders.count(),
-    db.restrictions.count(),
-  ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  const [yards, switches, inspections, faults, workOrders, restrictions, fieldReturns, reconciles, fieldCompletions] =
+    await Promise.all([
+      db.yards.count(),
+      db.switches.count(),
+      db.inspections.count(),
+      db.faults.count(),
+      db.workOrders.count(),
+      db.restrictions.count(),
+      db.fieldReturns.count(),
+      db.reconciles.count(),
+      db.fieldCompletions.count(),
+    ]);
+  return { yards, switches, inspections, faults, workOrders, restrictions, fieldReturns, reconciles, fieldCompletions };
 }
 
 /** 结构版本信息 */

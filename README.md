@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 评定病害等级（轻 / 中 / 重）、批量调整、批量升级、手工销号与撤销
 - 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
+- **现场回传**：导出时携带作业单派工基线（冻结快照）、关联病害与登记中的封锁条件；区间断网离线登记完工与见证资料，回站按编号挂回；负责人 / 人员 / 机具差异两方来源都保留并先入待处理处，处理前状态冻结；封锁解除且核对病害后再核对销号，整包失败按检查点重试、重复导入不重复建档、旧数据兼容回填派工基线
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -80,20 +81,21 @@ sologsb101-1004/
         ├── main.tsx             # 入口：Redux Provider + ThemeProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 站场上下文 + 统计）
         ├── styles/main.css
-        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts persistence.ts
-        ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts
+        ├── types/               # yard.ts switch.ts inspection.ts fault.ts workOrder.ts fieldReturn.ts reconcile.ts persistence.ts
+        ├── stores/              # index.ts yardStore.ts switchStore.ts faultStore.ts workOrderStore.ts fieldReturnStore.ts
         ├── components/common/   # SeverityTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/fieldreturn/ # ReturnPackageBar.tsx（回传包导出/导入/检查点）PendingReturnPanel.tsx（待处理处与核对销号）
         ├── hooks/               # useFaultFilter.ts useIdbTable.ts useAppStore.ts
         ├── pages/               # YardList.tsx InspectionEntry.tsx FaultBoard.tsx WorkOrderPlan.tsx ProgressView.tsx BackupView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # severity.ts window.ts db.ts export.ts events.ts format.ts
+        └── utils/               # severity.ts window.ts db.ts fieldReturn.ts fieldImport.ts events.ts format.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，登记了 v1 → v2（行修订号、`faultType → type` / `faultPart → part`、`faultIds` 字符串拆数组、新增 `restrictions` / `settings` 表）与 v2 → v3（新增现场回传三表、旧作业单缺少派工基线时兼容回填并冻结、行修订号升至 3）的 `upgrade` 迁移。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -102,9 +104,19 @@ sologsb101-1004/
   | `switches` | 道岔 | id / yardId / code / frogNumber / railType / [yardId+code] |
   | `inspections` | 巡检 | id / switchId / date / inspector / [switchId+date] |
   | `faults` | 病害 | id / inspectionId / part / severity / state / [inspectionId+part] |
-  | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
+  | `workOrders` | 天窗作业单（含派工基线快照 `dispatchBaseline`） | id / code / state / windowStart / leader |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
+  | `fieldReturns` | 现场回传包导入记录（含原始 JSON 与检查点 stage） | id / importedAt / stage |
+  | `reconciles` | 待处理缺口（人员机具差异 / 病害 / 封锁 / 未挂回，两方来源并存） | id / packageId / workOrderId / kind / status |
+  | `fieldCompletions` | 现场完工与见证资料登记（按作业单一对一） | workOrderId / packageId |
   | `settings` | 自定义字典 | id |
+
+- **现场回传流程**（入口在「作业进度与销号回写」页）：
+  1. **导出**：勾选作业单 → 生成离线回传包，内含派工基线（冻结的负责人 / 人员 / 机具 / 时间窗 / 关联病害编号）、关联病害摘要与登记中、时间窗重叠的封锁条件；旧作业单缺基线时按当前内容兼容回填（`backfilled=true`）。
+  2. **现场离线登记**：完工时间 / 登记人、实际负责人 / 人员 / 机具、见证资料（照片 / 视频 / 测量记录 / 签认单）、逐条病害核对结论与封锁状态，写回包内 JSON。
+  3. **回站导入合并**：按基线编号（id 优先、单号兜底）挂回本地；分 `register → link → reconcile → done` 四个检查点、每阶段独立事务，整包失败可从检查点重试；回传包按 `packageId`、缺口按确定性主键去重，重复导入不重复建档；挂不回的作业单进待处理处。
+  4. **待处理处核对**：负责人 / 人员 / 机具与本地不一致时两方来源都保留，处理仅记录结论、不覆盖作业单；缺口未清时作业单任何状态推进都被冻结。
+  5. **核对销号**：封锁条件全部解除（导入后实时复核本地登记）、关联病害现场确认已修复并核对通过后才销号并置作业单为已完成；缺口没清掉时留在待处理处并说明。
 
 - **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
 - **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。

@@ -1,18 +1,21 @@
 /**
  * Redux Toolkit store 组装
- * 四个业务 slice：yardStore（站场与道岔台账）、switchStore（道岔筛选与部件字典）、
- * faultStore（病害与销号）、workOrderStore（天窗作业单与进度推进）。
+ * 五个业务 slice：yardStore（站场与道岔台账）、switchStore（道岔筛选与部件字典）、
+ * faultStore（病害与销号）、workOrderStore（天窗作业单与进度推进）、
+ * fieldReturnStore（现场回传包、待处理缺口与核对销号）。
  */
 import { configureStore } from '@reduxjs/toolkit';
 import yardReducer from './yardStore';
 import switchReducer from './switchStore';
 import faultReducer from './faultStore';
 import workOrderReducer from './workOrderStore';
+import fieldReturnReducer from './fieldReturnStore';
 import { subscribeChange } from '../utils/events';
 import { loadYardData } from './yardStore';
 import { loadSwitchData } from './switchStore';
 import { loadFaultData } from './faultStore';
 import { loadWorkOrderData } from './workOrderStore';
+import { loadFieldReturnData } from './fieldReturnStore';
 
 export const store = configureStore({
   reducer: {
@@ -20,6 +23,7 @@ export const store = configureStore({
     switch: switchReducer,
     fault: faultReducer,
     workOrder: workOrderReducer,
+    fieldReturn: fieldReturnReducer,
   },
   middleware: (getDefaultMiddleware) =>
     getDefaultMiddleware({
@@ -38,6 +42,7 @@ export async function refreshAll(): Promise<void> {
     store.dispatch(loadSwitchData()),
     store.dispatch(loadFaultData()),
     store.dispatch(loadWorkOrderData()),
+    store.dispatch(loadFieldReturnData()),
   ]);
 }
 

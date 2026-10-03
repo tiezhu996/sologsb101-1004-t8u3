@@ -31,6 +31,7 @@ import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
 import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews } from '../stores/workOrderStore';
 import { selectFaultViews } from '../stores/faultStore';
+import { selectOrderBlockedMap } from '../stores/fieldReturnStore';
 import {
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
@@ -43,6 +44,8 @@ import { downloadCsv, share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ReturnPackageBar from '../components/fieldreturn/ReturnPackageBar';
+import PendingReturnPanel from '../components/fieldreturn/PendingReturnPanel';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
 
 const STATE_ORDER: WorkOrderState[] = ['planned', 'issued', 'working', 'done'];
@@ -53,6 +56,7 @@ export default function ProgressView() {
   const orders = useAppSelector(selectWorkOrderViews);
   const faults = useAppSelector(selectFaultViews);
   const stats = useAppSelector(selectWindowStats);
+  const blockedMap = useAppSelector(selectOrderBlockedMap);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['state', 'yard']);
@@ -100,6 +104,10 @@ export default function ProgressView() {
   const advance = async (id: string, next: WorkOrderState, code: string): Promise<void> => {
     try {
       const result = await dispatch(advanceWorkOrder({ id, next })).unwrap();
+      if (result.blocked.length > 0) {
+        setToast(`${code} 暂不能推进：${result.blocked[0]}`);
+        return;
+      }
       if (next === 'done') {
         setToast(`${code} 已完成，回写销号 ${result.solvedCount} 处病害`);
       } else {
@@ -193,6 +201,11 @@ export default function ProgressView() {
         </Grid>
       </Grid>
 
+      <Stack spacing={1.75} mb={1.75}>
+        <ReturnPackageBar />
+        <PendingReturnPanel />
+      </Stack>
+
       <FilterBar
         keywordPlaceholder="按作业单号 / 负责人 / 病害搜索"
         selects={[
@@ -231,6 +244,8 @@ export default function ProgressView() {
                 order.state === 'done' ? 100 : order.state === 'working' ? 60 : order.state === 'issued' ? 30 : 10;
               const nextStates = WORK_ORDER_STATE_FLOW[order.state];
               const relatedFaults = faults.filter((item) => order.faultIds.includes(item.id));
+              const gate = blockedMap.get(order.id);
+              const blocked = Boolean(gate?.blocked);
               return (
                 <Paper key={order.id} variant="outlined" sx={{ borderRadius: 2, p: 1.75 }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start" flexWrap="wrap" useFlexGap>
@@ -258,20 +273,37 @@ export default function ProgressView() {
                     </Box>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
                       {nextStates.map((next) => (
-                        <Button
+                        <Tooltip
                           key={next}
-                          size="small"
-                          variant={next === 'done' ? 'contained' : 'outlined'}
-                          color={next === 'done' ? 'success' : 'primary'}
-                          startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
-                          onClick={() => void advance(order.id, next, order.code)}
+                          title={
+                            blocked
+                              ? `现场回传缺口处理前不能推进：${(gate?.reasons ?? []).join('；')}`
+                              : next === 'done' && gate?.hasCompletion
+                                ? '该单有现场完工登记，请在下方待处理处核对封锁条件与关联病害后「核对销号」'
+                                : ''
+                          }
                         >
-                          推进为{WORK_ORDER_STATE_LABEL[next]}
-                        </Button>
+                          <span>
+                            <Button
+                              size="small"
+                              variant={next === 'done' ? 'contained' : 'outlined'}
+                              color={next === 'done' ? 'success' : 'primary'}
+                              startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
+                              disabled={blocked || (next === 'done' && Boolean(gate?.hasCompletion))}
+                              onClick={() => void advance(order.id, next, order.code)}
+                            >
+                              推进为{WORK_ORDER_STATE_LABEL[next]}
+                            </Button>
+                          </span>
+                        </Tooltip>
                       ))}
                       {order.state === 'done' ? (
                         <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
                       ) : null}
+                      {gate?.hasCompletion ? (
+                        <Chip size="small" color="info" variant="outlined" label="现场已登记完工" />
+                      ) : null}
+                      {blocked ? <Chip size="small" color="error" label="待处理缺口未清，状态冻结" /> : null}
                     </Stack>
                   </Stack>
 
@@ -352,7 +384,9 @@ export default function ProgressView() {
 
       <Alert severity="info" sx={{ mt: 2 }}>
         说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
-        可在「病害评定与销号」页撤销销号。
+        可在「病害评定与销号」页撤销销号。走现场回传的作业单：现场先登记完工与见证资料，回站导入后须在
+        「待处理处」处理完负责人 / 人员 / 机具等差异，并等封锁条件解除、核对关联病害后再「核对销号」；
+        缺口没清掉时作业状态保持冻结。
       </Alert>
 
       <Snackbar

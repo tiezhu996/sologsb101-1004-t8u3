@@ -1,4 +1,5 @@
 import type { Revisioned } from './persistence';
+import type { DispatchBaseline } from './fieldReturn';
 
 /** 天窗作业单状态 */
 export type WorkOrderState = 'planned' | 'issued' | 'working' | 'done';
@@ -37,6 +38,11 @@ export interface WorkOrder extends Revisioned {
   members: string[];
   /** 状态 */
   state: WorkOrderState;
+  /**
+   * 派工基线：作业单编排时冻结，作为现场回传包挂回主索引。
+   * 旧数据可能缺省（v3 迁移 / 兼容导入时按当前作业单内容回填，backfilled=true）。
+   */
+  dispatchBaseline?: DispatchBaseline;
   createdAt: string;
   updatedAt: string;
 }
