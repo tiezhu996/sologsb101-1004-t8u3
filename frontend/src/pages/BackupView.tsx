@@ -30,6 +30,7 @@ import {
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
+import LockOpenIcon from '@mui/icons-material/LockOpen';
 import CloudDownloadIcon from '@mui/icons-material/CloudDownload';
 import CloudUploadIcon from '@mui/icons-material/CloudUpload';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
@@ -56,6 +57,9 @@ import {
 import { backupFilename, downloadJson, readJsonFile } from '../utils/format';
 import { nowDateTime, shiftDate, todayDate } from '../utils/window';
 import { share } from '../utils/format';
+import { isBlockRestriction, isRestrictionActive } from '../types/restriction';
+import { useAppDispatch } from '../hooks/useAppStore';
+import { liftRestriction } from '../stores/fieldStore';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 
@@ -80,6 +84,7 @@ function defaultRestriction(yardId: string): RestrictionForm {
 }
 
 export default function BackupView() {
+  const dispatch = useAppDispatch();
   const yards = useAppSelector(selectYardViews);
   const switches = useAppSelector(selectSwitchViews);
   const faultCounts = useAppSelector(selectFaultCounts);
@@ -124,6 +129,7 @@ export default function BackupView() {
       period: `${restrictionDialog.form.periodStart} ~ ${restrictionDialog.form.periodEnd}`,
       reason: restrictionDialog.form.reason.trim(),
       createdAt: nowDateTime(),
+      liftedAt: null,
       revision: ROW_REVISION,
     });
     await reloadRestrictions();
@@ -257,8 +263,9 @@ export default function BackupView() {
                     <TableRow>
                       <TableCell>站场</TableCell>
                       <TableCell>道岔</TableCell>
-                      <TableCell>限速</TableCell>
+                      <TableCell>限速 / 封锁</TableCell>
                       <TableCell>起止</TableCell>
+                      <TableCell>状态</TableCell>
                       <TableCell>原因</TableCell>
                       <TableCell align="right">操作</TableCell>
                     </TableRow>
@@ -266,29 +273,58 @@ export default function BackupView() {
                   <TableBody>
                     {rows.map((row) => {
                       const yard = yards.find((item) => item.id === row.yardId);
+                      const active = isRestrictionActive(row);
                       return (
                         <TableRow key={row.id} hover>
                           <TableCell>{yard?.name ?? '未知站场'}</TableCell>
                           <TableCell>{row.switchCode || '站场级'}</TableCell>
                           <TableCell>
-                            <Chip size="small" color={row.limitKmh <= 25 ? 'error' : 'warning'} label={`${row.limitKmh} km/h`} />
+                            <Chip
+                              size="small"
+                              color={isBlockRestriction(row) ? 'error' : row.limitKmh <= 25 ? 'error' : 'warning'}
+                              label={isBlockRestriction(row) ? '封锁（停车）' : `${row.limitKmh} km/h`}
+                            />
                           </TableCell>
                           <TableCell>{row.period}</TableCell>
+                          <TableCell>
+                            <Chip
+                              size="small"
+                              color={active ? 'error' : 'success'}
+                              variant={active ? 'filled' : 'outlined'}
+                              label={active ? '登记中' : `已解除 ${row.liftedAt ? row.liftedAt.slice(0, 10) : ''}`}
+                            />
+                          </TableCell>
                           <TableCell>{row.reason}</TableCell>
                           <TableCell align="right">
-                            <Button
-                              size="small"
-                              color="error"
-                              startIcon={<DeleteIcon />}
-                              onClick={async () => {
-                                await removeRestriction(row.id);
-                                await reloadRestrictions();
-                                await reloadCounts();
-                                setToast('封锁条件已删除');
-                              }}
-                            >
-                              删除
-                            </Button>
+                            <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+                              {active ? (
+                                <Button
+                                  size="small"
+                                  color="success"
+                                  startIcon={<LockOpenIcon />}
+                                  onClick={async () => {
+                                    await dispatch(liftRestriction(row.id));
+                                    await reloadRestrictions();
+                                    setToast('封锁 / 慢行条件已解除，可回现场回传页核对销号');
+                                  }}
+                                >
+                                  解除
+                                </Button>
+                              ) : null}
+                              <Button
+                                size="small"
+                                color="error"
+                                startIcon={<DeleteIcon />}
+                                onClick={async () => {
+                                  await removeRestriction(row.id);
+                                  await reloadRestrictions();
+                                  await reloadCounts();
+                                  setToast('封锁条件已删除');
+                                }}
+                              >
+                                删除
+                              </Button>
+                            </Stack>
                           </TableCell>
                         </TableRow>
                       );

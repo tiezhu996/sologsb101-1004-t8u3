@@ -5,12 +5,12 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
   ROW_REVISION,
+  db,
   listFaults,
   listInspections,
   listSwitches,
   listWorkOrders,
   listYards,
-  putFaults,
   putWorkOrder,
   removeWorkOrder,
   type FaultRow,
@@ -18,6 +18,7 @@ import {
   type SwitchRow,
   type WorkOrderRow,
   type YardRow,
+  type PendingItemRow,
 } from '../utils/db';
 import {
   WORK_ORDER_STATE_FLOW,
@@ -34,6 +35,8 @@ import {
   windowMinutes,
 } from '../utils/window';
 import { emitChange } from '../utils/events';
+import { buildDispatchBaseline } from '../utils/export';
+import { pendingGateOf } from '../types/pending';
 
 export interface WorkOrderStateSlice {
   workOrders: WorkOrderRow[];
@@ -41,6 +44,8 @@ export interface WorkOrderStateSlice {
   inspections: InspectionRow[];
   switches: SwitchRow[];
   yards: YardRow[];
+  /** 待处理缺口（来自现场回传，负责人/人员/机具分歧未处理前阻断推进） */
+  pendingItems: PendingItemRow[];
   /** 编排时勾选的病害 */
   selectedFaultIds: string[];
   loading: boolean;
@@ -53,6 +58,7 @@ const initialState: WorkOrderStateSlice = {
   inspections: [],
   switches: [],
   yards: [],
+  pendingItems: [],
   selectedFaultIds: [],
   loading: false,
   error: '',
@@ -65,19 +71,21 @@ export const loadWorkOrderData = createAsyncThunk<
     inspections: InspectionRow[];
     switches: SwitchRow[];
     yards: YardRow[];
+    pendingItems: PendingItemRow[];
   },
   void,
   { rejectValue: string }
 >('workOrder/load', async (_arg, { rejectWithValue }) => {
   try {
-    const [workOrders, faults, inspections, switches, yards] = await Promise.all([
+    const [workOrders, faults, inspections, switches, yards, pendingItems] = await Promise.all([
       listWorkOrders(),
       listFaults(),
       listInspections(),
       listSwitches(),
       listYards(),
+      db.pendingItems.toArray(),
     ]);
-    return { workOrders, faults, inspections, switches, yards };
+    return { workOrders, faults, inspections, switches, yards, pendingItems };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '作业单读取失败');
   }
@@ -111,6 +119,9 @@ export const createWorkOrder = createAsyncThunk<
       machines: draft.machines,
       members: draft.members,
       state: 'planned',
+      // 待编排阶段先按当前安排回填兼容基线；下达到达时会重新冻结为正式派工基线
+      dispatchBaseline: undefined,
+      completionId: null,
       createdAt: nowDateTime(),
       updatedAt: nowDateTime(),
       revision: ROW_REVISION,
@@ -131,6 +142,23 @@ export const updateWorkOrder = createAsyncThunk<
     const state = getState().workOrder;
     const existing = state.workOrders.find((item) => item.id === id);
     if (!existing) return;
+    // 尚未下达的作业单被重新编排时，同步刷新兼容派工基线（正式基线在下达时冻结）
+    const refreshBaseline =
+      existing.state === 'planned'
+        ? buildDispatchBaseline(
+            {
+              code: draft.code.trim(),
+              faultIds: draft.faultIds,
+              windowStart: draft.windowStart,
+              windowEnd: draft.windowEnd,
+              leader: draft.leader.trim(),
+              machines: draft.machines,
+              members: draft.members,
+            },
+            nowDateTime(),
+            existing.dispatchBaseline?.source === 'legacyBackfill' ? 'legacyBackfill' : 'issued',
+          )
+        : existing.dispatchBaseline;
     await putWorkOrder({
       ...existing,
       code: draft.code.trim(),
@@ -140,6 +168,7 @@ export const updateWorkOrder = createAsyncThunk<
       leader: draft.leader.trim(),
       machines: draft.machines,
       members: draft.members,
+      dispatchBaseline: refreshBaseline,
       updatedAt: nowDateTime(),
     });
     emitChange();
@@ -150,7 +179,9 @@ export const updateWorkOrder = createAsyncThunk<
 
 /**
  * 推进作业单状态。
- * 推进到「已完成」时，把关联病害批量置为已销号（回写销号）。
+ * - 负责人 / 人员 / 机具现场分歧未处理（open 且阻断推进）时拒绝推进。
+ * - 推进到「已完成」仅作兼容保留：正常流程改为现场页「核对销号」闸门
+ *   （先登记完工与见证，封锁解除并核对关联病害后才销号），故此处不再自动销号。
  */
 export const advanceWorkOrder = createAsyncThunk<
   { state: WorkOrderState; solvedCount: number },
@@ -164,25 +195,36 @@ export const advanceWorkOrder = createAsyncThunk<
     const allowed = WORK_ORDER_STATE_FLOW[existing.state];
     if (!allowed.includes(next)) return { state: existing.state, solvedCount: 0 };
 
-    let solvedCount = 0;
-    if (next === 'done') {
-      const related = state.faults.filter(
-        (item) => existing.faultIds.includes(item.id) && item.state === 'pending',
+    // 人员 / 负责人 / 机具分歧两方来源未对账前，不能推进作业状态
+    const advanceBlockers = state.pendingItems.filter(
+      (item) =>
+        item.workOrderId === id &&
+        item.status === 'open' &&
+        pendingGateOf(item.kind) === 'advance',
+    );
+    if (advanceBlockers.length > 0) {
+      return rejectWithValue(
+        `现场安排与派工基线尚有 ${advanceBlockers.length} 处分歧未处理（${advanceBlockers
+          .map((item) => item.detail)
+          .join('；')}），处理后才能推进`,
       );
-      if (related.length > 0) {
-        await putFaults(
-          related.map((item) => ({ ...item, state: 'solved' as const, solvedAt: nowDateTime() })),
-        );
-        solvedCount = related.length;
-      }
     }
-    await putWorkOrder({
+
+    const stamp = nowDateTime();
+    const updated: WorkOrderRow = {
       ...existing,
       state: next,
-      updatedAt: nowDateTime(),
-    });
+      updatedAt: stamp,
+      // 下达到达：冻结派工基线（已有基线的历史单不重复冻结）
+      dispatchBaseline:
+        next === 'issued'
+          ? existing.dispatchBaseline ?? buildDispatchBaseline(existing, stamp, 'issued')
+          : existing.dispatchBaseline,
+      completionId: existing.completionId ?? null,
+    };
+    await putWorkOrder(updated);
     emitChange();
-    return { state: next, solvedCount };
+    return { state: next, solvedCount: 0 };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '推进作业单失败');
   }
@@ -230,6 +272,7 @@ const workOrderSlice = createSlice({
         state.inspections = action.payload.inspections;
         state.switches = action.payload.switches;
         state.yards = action.payload.yards;
+        state.pendingItems = action.payload.pendingItems;
         const validIds = new Set(action.payload.faults.map((item) => item.id));
         state.selectedFaultIds = state.selectedFaultIds.filter((id) => validIds.has(id));
       })
@@ -247,9 +290,9 @@ interface RootLike {
   workOrder: WorkOrderStateSlice;
 }
 
-/** 作业单视图：带病害标签、时长、冲突与未销号数量 */
+/** 作业单视图：带病害标签、时长、冲突、未销号数量与现场回传闸门计数 */
 export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
-  const { workOrders, faults, inspections, switches, yards } = state.workOrder;
+  const { workOrders, faults, inspections, switches, yards, pendingItems } = state.workOrder;
   const switchIdOfFault = (fault: FaultRow): string | undefined => {
     const inspection = inspections.find((row) => row.id === fault.inspectionId);
     return inspection?.switchId;
@@ -257,6 +300,7 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
   return workOrders
     .map((order) => {
       const related = faults.filter((item) => order.faultIds.includes(item.id));
+      const orderPending = pendingItems.filter((item) => item.workOrderId === order.id && item.status === 'open');
       const labels = related.map((item) => {
         const switchRow = switches.find((row) => row.id === switchIdOfFault(item));
         return `${switchRow?.code ?? '-'} ${item.part}/${item.type}`;
@@ -303,6 +347,9 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         memberConflict: memberConflicts.length > 0,
         machineConflict: machineConflicts.length > 0,
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
+        completionRegistered: Boolean(order.completionId),
+        advanceBlockCount: orderPending.filter((item) => pendingGateOf(item.kind) === 'advance').length,
+        closeoutBlockCount: orderPending.filter((item) => pendingGateOf(item.kind) === 'closeout').length,
       };
     })
     .sort((a, b) => a.windowStart.localeCompare(b.windowStart));

@@ -11,34 +11,27 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
-import { ROW_REVISION, type Revisioned } from '../types/persistence';
+import type { SpeedRestriction } from '../types/restriction';
+import type { FieldCompletion } from '../types/fieldReturn';
+import type { PendingItem } from '../types/pending';
+import type { ImportBatch } from '../types/importBatch';
+import { ROW_REVISION } from '../types/persistence';
+import type { Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
+import { buildDispatchBaseline } from './export';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
 
-/** 封锁 / 慢行条件登记（/backup 页） */
-export interface SpeedRestriction extends Revisioned {
-  id: string;
-  /** 关联站场 */
-  yardId: string;
-  /** 关联道岔（可空，表示站场级） */
-  switchCode: string;
-  /** 限速值 km/h */
-  limitKmh: number;
-  /** 起止时间描述 */
-  period: string;
-  /** 登记原因 */
-  reason: string;
-  createdAt: string;
-}
+/** 封锁 / 慢行条件（类型定义迁到 types/restriction.ts，此处再导出保持兼容） */
+export type { SpeedRestriction } from '../types/restriction';
 
 export type YardRow = Yard;
 export type SwitchRow = Switch;
@@ -46,6 +39,9 @@ export type InspectionRow = Inspection;
 export type FaultRow = Fault;
 export type WorkOrderRow = WorkOrder;
 export type SpeedRestrictionRow = SpeedRestriction;
+export type FieldCompletionRow = FieldCompletion;
+export type PendingItemRow = PendingItem;
+export type ImportBatchRow = ImportBatch;
 
 class RailSwitchDatabase extends Dexie {
   yards!: Table<YardRow, string>;
@@ -54,6 +50,9 @@ class RailSwitchDatabase extends Dexie {
   faults!: Table<FaultRow, string>;
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
+  completions!: Table<FieldCompletionRow, string>;
+  pendingItems!: Table<PendingItemRow, string>;
+  importBatches!: Table<ImportBatchRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
   constructor() {
@@ -70,17 +69,33 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
+    this.version(2).stores({
+      yards: 'id, name, region, mileage',
+      switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+      inspections: 'id, switchId, date, inspector, [switchId+date]',
+      faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+      workOrders: 'id, code, state, windowStart, leader',
+      restrictions: 'id, yardId, switchCode',
+      settings: 'id',
+    });
+
+    // v3：现场回传——作业单挂派工基线与完工登记；封锁条件补解除时间；
+    //     新增完工见证（completions）、待处理缺口（pendingItems）、导入检查点（importBatches）三表
     this.version(DB_SCHEMA_VERSION)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
         inspections: 'id, switchId, date, inspector, [switchId+date]',
         faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
-        workOrders: 'id, code, state, windowStart, leader',
-        restrictions: 'id, yardId, switchCode',
+        workOrders: 'id, code, state, windowStart, leader, completionId',
+        restrictions: 'id, yardId, switchCode, liftedAt',
+        completions: 'id, workOrderId, packageId',
+        pendingItems: 'id, workOrderId, status, gate, kind',
+        importBatches: 'id, workOrderId, status',
         settings: 'id',
       })
       .upgrade(async (tx) => {
+        // v1 → v2 的字段补齐（Dexie 升级链上旧库首次打开时仍需执行）
         const tables: Array<Table<Record<string, unknown>, string>> = [
           tx.table('yards'),
           tx.table('switches'),
@@ -90,7 +105,7 @@ class RailSwitchDatabase extends Dexie {
         ];
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION;
+            if (typeof row.revision !== 'number') row.revision = ROW_REVISION;
             if (typeof row.createdAt !== 'string') row.createdAt = nowIso();
           });
         }
@@ -100,6 +115,7 @@ class RailSwitchDatabase extends Dexie {
           if (typeof row.part !== 'string' && typeof row.faultPart === 'string') row.part = row.faultPart;
           if (row.solvedAt === undefined) row.solvedAt = null;
           if (row.sizeMm === undefined) row.sizeMm = null;
+          row.revision = ROW_REVISION;
         });
         // 迁移：旧版作业单 faultIds 为字符串时拆分为数组
         await tx.table('workOrders').toCollection().modify((row: Record<string, unknown>) => {
@@ -111,6 +127,15 @@ class RailSwitchDatabase extends Dexie {
           }
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
+          if (row.completionId === undefined) row.completionId = null;
+          row.revision = ROW_REVISION;
+          // 旧数据缺少派工基线：迁移期先标记，首屏初始化后由 ensureDispatchBaselines 按兼容方式回填
+          if (!row.dispatchBaseline) row.dispatchBaseline = null;
+        });
+        // v2 → v3：封锁条件补解除时间字段（null = 登记中）
+        await tx.table('restrictions').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.liftedAt === undefined) row.liftedAt = null;
+          row.revision = ROW_REVISION;
         });
       });
   }
@@ -295,16 +320,38 @@ async function seedDatabase(): Promise<void> {
 
   groups.forEach((group, index) => {
     if (group.faults.length === 0) return;
+    const windowStart = group.start;
+    const windowEnd = group.end;
+    const leader = group.leader;
+    const machines = index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'];
+    const members = index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'];
+    const faultIds = group.faults.map((item) => item.id);
+    // 派工基线：与下达安排一致（冻结快照）
+    const baseline = buildDispatchBaseline(
+      {
+        code: `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`,
+        leader,
+        members,
+        machines,
+        windowStart,
+        windowEnd,
+        faultIds,
+      },
+      stamp,
+      'issued',
+    );
     workOrders.push({
       id: `wo-${index + 1}`,
-      code: `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`,
-      faultIds: group.faults.map((item) => item.id),
-      windowStart: group.start,
-      windowEnd: group.end,
-      leader: group.leader,
-      machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
-      members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
+      code: baseline.code,
+      faultIds,
+      windowStart,
+      windowEnd,
+      leader,
+      machines,
+      members,
       state: group.state,
+      dispatchBaseline: baseline,
+      completionId: null,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -320,6 +367,7 @@ async function seedDatabase(): Promise<void> {
       period: `${shiftDate(-2)} ~ ${shiftDate(5)}`,
       reason: '辙叉心磨耗超限，封锁前临时慢行',
       createdAt: stamp,
+      liftedAt: null,
       revision: ROW_REVISION,
     },
     {
@@ -330,6 +378,19 @@ async function seedDatabase(): Promise<void> {
       period: `${shiftDate(1)} ~ ${shiftDate(1)}`,
       reason: '交分道岔打磨作业，天窗内限速',
       createdAt: stamp,
+      liftedAt: null,
+      revision: ROW_REVISION,
+    },
+    {
+      // 封锁条件（停车）：解除前关联作业单不能核对销号
+      id: 'restrict-3',
+      yardId: 'yard-1',
+      switchCode: '7#',
+      limitKmh: 0,
+      period: `${shiftDate(-1)} ~ ${shiftDate(2)}`,
+      reason: 'II 道东端渡线辙叉重伤，封锁待换，作业完成后解除',
+      createdAt: stamp,
+      liftedAt: null,
       revision: ROW_REVISION,
     },
   );
@@ -350,6 +411,26 @@ async function seedDatabase(): Promise<void> {
 
 /* ============================== 初始化 ============================== */
 
+/**
+ * 旧数据兼容回填：缺少派工基线的作业单，按当前安排快照回填并标记 legacyBackfill。
+ * 在首屏初始化后执行（Dexie upgrade 内无法调用模块级纯函数之外的循环依赖，
+ * 故回填放运行时，幂等——已有基线不动）。
+ */
+export async function ensureDispatchBaselines(): Promise<number> {
+  const orders = await db.workOrders.toArray();
+  const missing = orders.filter((order) => !order.dispatchBaseline);
+  if (missing.length === 0) return 0;
+  const stamp = nowDateTime();
+  await db.workOrders.bulkPut(
+    missing.map((order) => ({
+      ...order,
+      completionId: order.completionId ?? null,
+      dispatchBaseline: buildDispatchBaseline(order, stamp, 'legacyBackfill'),
+    })),
+  );
+  return missing.length;
+}
+
 /** 打开数据库；站场表为空时播种演示数据（幂等） */
 export async function initDatabase(): Promise<void> {
   await db.open();
@@ -357,6 +438,8 @@ export async function initDatabase(): Promise<void> {
   if (count === 0) {
     await seedDatabase();
   }
+  // 旧数据缺少派工基线时按兼容方式回填
+  await ensureDispatchBaselines();
 }
 
 /* ============================== 站场 ============================== */
@@ -528,6 +611,47 @@ export async function removeRestriction(id: string): Promise<void> {
   await db.restrictions.delete(id);
 }
 
+/* ====================== 现场完工 / 待处理 / 检查点 ====================== */
+
+export async function listCompletions(): Promise<FieldCompletionRow[]> {
+  const rows = await db.completions.toArray();
+  return rows.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt));
+}
+
+export async function putCompletion(row: FieldCompletionRow): Promise<void> {
+  await db.completions.put(row);
+}
+
+export async function listPendingItems(): Promise<PendingItemRow[]> {
+  const rows = await db.pendingItems.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function putPendingItem(row: PendingItemRow): Promise<void> {
+  await db.pendingItems.put(row);
+}
+
+export async function putPendingItems(rows: PendingItemRow[]): Promise<void> {
+  if (rows.length) await db.pendingItems.bulkPut(rows);
+}
+
+export async function listImportBatches(): Promise<ImportBatchRow[]> {
+  const rows = await db.importBatches.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function getImportBatch(id: string): Promise<ImportBatchRow | undefined> {
+  return db.importBatches.get(id);
+}
+
+export async function putImportBatch(row: ImportBatchRow): Promise<void> {
+  await db.importBatches.put(row);
+}
+
+export async function deleteImportBatch(id: string): Promise<void> {
+  await db.importBatches.delete(id);
+}
+
 /* ========================== 整库导入导出 ========================== */
 
 export interface DatabaseSnapshot {
@@ -540,17 +664,24 @@ export interface DatabaseSnapshot {
   faults: Fault[];
   workOrders: WorkOrder[];
   restrictions: SpeedRestriction[];
+  completions: FieldCompletion[];
+  pendingItems: PendingItem[];
+  importBatches: ImportBatch[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
-    listYards(),
-    listSwitches(),
-    listInspections(),
-    listFaults(),
-    listWorkOrders(),
-    listRestrictions(),
-  ]);
+  const [yards, switches, inspections, faults, workOrders, restrictions, completions, pendingItems, importBatches] =
+    await Promise.all([
+      listYards(),
+      listSwitches(),
+      listInspections(),
+      listFaults(),
+      listWorkOrders(),
+      listRestrictions(),
+      listCompletions(),
+      listPendingItems(),
+      listImportBatches(),
+    ]);
   return {
     name: DB_NAME,
     schemaVersion: DB_SCHEMA_VERSION,
@@ -561,13 +692,26 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     faults,
     workOrders,
     restrictions,
+    completions,
+    pendingItems,
+    importBatches,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.completions,
+      db.pendingItems,
+      db.importBatches,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -576,6 +720,9 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.completions.clear(),
+        db.pendingItems.clear(),
+        db.importBatches.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
       await db.switches.bulkPut(snapshot.switches ?? []);
@@ -583,15 +730,30 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.faults.bulkPut(snapshot.faults ?? []);
       await db.workOrders.bulkPut(snapshot.workOrders ?? []);
       await db.restrictions.bulkPut(snapshot.restrictions ?? []);
+      await db.completions.bulkPut(snapshot.completions ?? []);
+      await db.pendingItems.bulkPut(snapshot.pendingItems ?? []);
+      await db.importBatches.bulkPut(snapshot.importBatches ?? []);
     },
   );
+  // 旧备份缺少派工基线时按兼容方式回填
+  await ensureDispatchBaselines();
 }
 
 /** 清空并重新播种 */
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.completions,
+      db.pendingItems,
+      db.importBatches,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +762,9 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.completions.clear(),
+        db.pendingItems.clear(),
+        db.importBatches.clear(),
       ]);
     },
   );
@@ -608,15 +773,19 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
-    db.yards.count(),
-    db.switches.count(),
-    db.inspections.count(),
-    db.faults.count(),
-    db.workOrders.count(),
-    db.restrictions.count(),
-  ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  const [yards, switches, inspections, faults, workOrders, restrictions, completions, pendingItems, importBatches] =
+    await Promise.all([
+      db.yards.count(),
+      db.switches.count(),
+      db.inspections.count(),
+      db.faults.count(),
+      db.workOrders.count(),
+      db.restrictions.count(),
+      db.completions.count(),
+      db.pendingItems.count(),
+      db.importBatches.count(),
+    ]);
+  return { yards, switches, inspections, faults, workOrders, restrictions, completions, pendingItems, importBatches };
 }
 
 /** 结构版本信息 */

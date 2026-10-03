@@ -8,11 +8,13 @@ import yardReducer from './yardStore';
 import switchReducer from './switchStore';
 import faultReducer from './faultStore';
 import workOrderReducer from './workOrderStore';
+import fieldReducer from './fieldStore';
 import { subscribeChange } from '../utils/events';
 import { loadYardData } from './yardStore';
 import { loadSwitchData } from './switchStore';
 import { loadFaultData } from './faultStore';
 import { loadWorkOrderData } from './workOrderStore';
+import { loadFieldData } from './fieldStore';
 
 export const store = configureStore({
   reducer: {
@@ -20,6 +22,7 @@ export const store = configureStore({
     switch: switchReducer,
     fault: faultReducer,
     workOrder: workOrderReducer,
+    field: fieldReducer,
   },
   middleware: (getDefaultMiddleware) =>
     getDefaultMiddleware({
@@ -38,6 +41,7 @@ export async function refreshAll(): Promise<void> {
     store.dispatch(loadSwitchData()),
     store.dispatch(loadFaultData()),
     store.dispatch(loadWorkOrderData()),
+    store.dispatch(loadFieldData()),
   ]);
 }
 

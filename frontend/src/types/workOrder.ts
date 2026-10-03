@@ -1,4 +1,5 @@
 import type { Revisioned } from './persistence';
+import type { DispatchBaseline } from './baseline';
 
 /** 天窗作业单状态 */
 export type WorkOrderState = 'planned' | 'issued' | 'working' | 'done';
@@ -10,11 +11,11 @@ export const WORK_ORDER_STATE_LABEL: Record<WorkOrderState, string> = {
   done: '已完成',
 };
 
-/** 作业单状态流转 */
+/** 作业单状态流转（作业中 → 已完成只能走「核对销号」闸门：封锁解除 + 病害核对） */
 export const WORK_ORDER_STATE_FLOW: Record<WorkOrderState, WorkOrderState[]> = {
   planned: ['issued'],
   issued: ['working'],
-  working: ['done'],
+  working: [],
   done: [],
 };
 
@@ -37,6 +38,13 @@ export interface WorkOrder extends Revisioned {
   members: string[];
   /** 状态 */
   state: WorkOrderState;
+  /**
+   * 派工基线：下达时冻结的安排快照，现场回传包按它与本地/现场两相比对。
+   * 旧数据可能缺失，按兼容方式回填（legacyBackfill），故类型上允许 undefined。
+   */
+  dispatchBaseline?: DispatchBaseline;
+  /** 现场完工登记 id（登记完工后挂上，先不推进状态） */
+  completionId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -70,6 +78,12 @@ export interface WorkOrderView extends WorkOrder {
   machineConflict: boolean;
   /** 关联病害中仍未销号的数量 */
   pendingFaultCount: number;
+  /** 现场完工是否已登记（完工与见证资料） */
+  completionRegistered: boolean;
+  /** 待处理缺口中阻断作业状态推进的数量（负责人/人员/机具分歧） */
+  advanceBlockCount: number;
+  /** 待处理缺口中阻断核对销号的数量（封锁未解除/病害未处治等） */
+  closeoutBlockCount: number;
 }
 
 /** 常用机具字典 */
